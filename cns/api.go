@@ -14,8 +14,47 @@ const (
 	GetIPAddressUtilizationPath = "/network/ip/utilization"
 	GetUnhealthyIPAddressesPath = "/network/ipaddresses/unhealthy"
 	GetHealthReportPath         = "/network/health"
+	CreateLoadBalancerPath      = "/loadbalancer/create"
+	RetrieveLoadBalancerPath    = "/loadbalancer/retrieve"
+	DeleteLoadBalancerPath      = "/loadbalancer/delete"
 	V1Prefix                    = "/v0.1"
 )
+
+// CreateLoadBalancerRequest describes the Request to create a load balancer in CNS.
+type CreateLoadBalancerRequest struct {
+	LoadBalancerID string
+	NetworkName    string
+	LBConfig       LBConfiguration
+}
+
+// LBConfiguration describes the source port/IPip as well as its connected destination port/IPs.
+type LBConfiguration struct {
+	SourceIP          string
+	SourcePort        string
+	DestinationConfig DestinationConfiguration
+}
+
+// DestinationConfiguration describes the list of destination IPs as well and shared port.
+type DestinationConfiguration struct {
+	IPAddresses []string
+	Port        string
+}
+
+// RetrieveLoadBalancerRequest describes the Request of the unique load balancer.
+type RetrieveLoadBalancerRequest struct {
+	LoadBalancerID string
+}
+
+// RetrieveLoadBalancerResponse describes the response to reserve a load balancer.
+type RetrieveLoadBalancerResponse struct {
+	Response     Response
+	LoadBalancer LBConfiguration
+}
+
+// DeleteLoadBalancerRequest describes the Request to delete the load balancer.
+type DeleteLoadBalancerRequest struct {
+	LoadBalancerID string
+}
 
 // SetEnvironmentRequest describes the Request to set the environment in CNS.
 type SetEnvironmentRequest struct {

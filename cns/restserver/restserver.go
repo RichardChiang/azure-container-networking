@@ -5,16 +5,17 @@ package restserver
 
 import (
 	"fmt"
-	"net/http"
-	"time"
-
 	"net"
+	"net/http"
+	"sync"
+	"time"
 
 	"github.com/Azure/azure-container-networking/cns"
 	"github.com/Azure/azure-container-networking/cns/common"
 	"github.com/Azure/azure-container-networking/cns/dockerclient"
 	"github.com/Azure/azure-container-networking/cns/imdsclient"
 	"github.com/Azure/azure-container-networking/cns/ipamclient"
+	"github.com/Azure/azure-container-networking/cns/iptables"
 	"github.com/Azure/azure-container-networking/cns/routes"
 	"github.com/Azure/azure-container-networking/log"
 	"github.com/Azure/azure-container-networking/store"
@@ -31,9 +32,11 @@ type httpRestService struct {
 	dockerClient *dockerclient.DockerClient
 	imdsClient   *imdsclient.ImdsClient
 	ipamClient   *ipamclient.IpamClient
+	ipTable      *iptables.IpTableClient
 	routingTable *routes.RoutingTable
 	store        store.KeyValueStore
 	state        httpRestServiceState
+	sync.Mutex
 }
 
 // httpRestServiceState contains the state we would like to persist.
@@ -42,6 +45,7 @@ type httpRestServiceState struct {
 	NetworkType string
 	Initialized bool
 	TimeStamp   time.Time
+	ActiveLBs   map[string]interface{}
 }
 
 // HTTPService describes the min API interface that every service should have.
@@ -68,14 +72,24 @@ func NewHTTPRestService(config *common.ServiceConfig) (HTTPService, error) {
 		return nil, err
 	}
 
-	return &httpRestService{
+	ipt, err := iptables.NewIpTableClient()
+	if err != nil {
+		return nil, err
+	}
+
+	httpRestService := &httpRestService{
 		Service:      service,
 		store:        service.Service.Store,
 		dockerClient: dc,
 		imdsClient:   imdsClient,
 		ipamClient:   ic,
+		ipTable:      ipt,
 		routingTable: routingTable,
-	}, nil
+	}
+
+	httpRestService.state.ActiveLBs = make(map[string]interface{})
+
+	return httpRestService, nil
 }
 
 // Start starts the CNS listener.
@@ -98,6 +112,9 @@ func (service *httpRestService) Start(config *common.ServiceConfig) error {
 	listener.AddHandler(cns.GetHostLocalIPPath, service.getHostLocalIP)
 	listener.AddHandler(cns.GetIPAddressUtilizationPath, service.getIPAddressUtilization)
 	listener.AddHandler(cns.GetUnhealthyIPAddressesPath, service.getUnhealthyIPAddresses)
+	listener.AddHandler(cns.CreateLoadBalancerPath, service.createLoadBalancer)
+	listener.AddHandler(cns.RetrieveLoadBalancerPath, service.retrieveLoadBalancer)
+	listener.AddHandler(cns.DeleteLoadBalancerPath, service.deleteLoadBalancer)
 
 	// handlers for v0.1
 	listener.AddHandler(cns.V1Prefix+cns.SetEnvironmentPath, service.setEnvironment)
@@ -108,6 +125,9 @@ func (service *httpRestService) Start(config *common.ServiceConfig) error {
 	listener.AddHandler(cns.V1Prefix+cns.GetHostLocalIPPath, service.getHostLocalIP)
 	listener.AddHandler(cns.V1Prefix+cns.GetIPAddressUtilizationPath, service.getIPAddressUtilization)
 	listener.AddHandler(cns.V1Prefix+cns.GetUnhealthyIPAddressesPath, service.getUnhealthyIPAddresses)
+	listener.AddHandler(cns.V1Prefix+cns.CreateLoadBalancerPath, service.createLoadBalancer)
+	listener.AddHandler(cns.V1Prefix+cns.RetrieveLoadBalancerPath, service.retrieveLoadBalancer)
+	listener.AddHandler(cns.V1Prefix+cns.DeleteLoadBalancerPath, service.deleteLoadBalancer)
 
 	log.Printf("[Azure CNS]  Listening.")
 	return nil
@@ -122,6 +142,9 @@ func (service *httpRestService) Stop() {
 // Handles requests to set the environment type.
 func (service *httpRestService) setEnvironment(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Azure CNS] setEnvironment")
+
+	service.Lock()
+	defer service.Unlock()
 
 	var req cns.SetEnvironmentRequest
 	err := service.Listener.Decode(w, r, &req)
@@ -280,6 +303,190 @@ func (service *httpRestService) deleteNetwork(w http.ResponseWriter, r *http.Req
 
 	err = service.Listener.Encode(w, &resp)
 
+	log.Response(service.Name, resp, err)
+}
+
+// Handles CreateLoadBalancer requests.
+func (service *httpRestService) createLoadBalancer(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[Azure CNS] createLoadBalancer")
+
+	service.Lock()
+	defer service.Unlock()
+
+	var req cns.CreateLoadBalancerRequest
+	returnCode := 0
+	returnMessage := ""
+
+	err := service.Listener.Decode(w, r, &req)
+	log.Request(service.Name, &req, err)
+
+	if err != nil {
+		returnMessage = fmt.Sprintf("[Azure CNS] Error. Unable to decode input request.")
+		returnCode = InvalidParameter
+	} else {
+		switch r.Method {
+		case "POST":
+			dc := service.dockerClient
+			ipt := service.ipTable
+
+			err := dc.NetworkExists(req.NetworkName)
+			if err != nil {
+				returnMessage = "[Azure CNS] Error. Network with network name doesn't exist."
+				returnCode = UnsupportedNetworkType
+				break
+			}
+
+			_, ok := service.state.ActiveLBs[req.LoadBalancerID]
+			if ok {
+				returnMessage = "[Azure CNS] Error. Network with given load balancer ID already exists."
+				returnCode = InvalidParameter
+				break
+			}
+
+			ipt.InstallIPTables()
+
+			err = ipt.EnableIPForwarding()
+			if err != nil {
+				returnMessage = "[Azure CNS] Error. Unable to enable load balancer port forwarding."
+				returnCode = UnexpectedError
+				break
+			}
+
+			err = ipt.EnableMasquerade()
+			if err != nil {
+				returnMessage = "[Azure CNS] Error. Unable to enable load balancer masquerading."
+				returnCode = UnexpectedError
+				break
+			}
+
+			err = ipt.AddPreroutingFilters(req.LBConfig)
+			if err != nil {
+				returnMessage = "[Azure CNS] Error. Unable to add filter to the network."
+				returnCode = UnexpectedError
+			} else {
+				service.state.ActiveLBs[req.LoadBalancerID] = req.LBConfig
+				service.saveState()
+			}
+
+		default:
+			returnMessage = "[Azure CNS] Error. CreateLoadBalancer did not receive a POST."
+			returnCode = InvalidParameter
+		}
+	}
+	resp := cns.Response{
+		ReturnCode: returnCode,
+		Message:    returnMessage,
+	}
+
+	err = service.Listener.Encode(w, &resp)
+
+	log.Response(service.Name, resp, err)
+}
+
+// Handles retrieving a load balancer's configuration
+func (service *httpRestService) retrieveLoadBalancer(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[Azure CNS] retrieveLoadBalancer")
+
+	var req cns.RetrieveLoadBalancerRequest
+	returnCode := 0
+	returnMessage := ""
+	var LBConfig cns.LBConfiguration
+
+	err := service.Listener.Decode(w, r, &req)
+	log.Request(service.Name, &req, err)
+
+	if err != nil {
+		returnMessage = fmt.Sprintf("[Azure CNS] Error. Unable to decode input request.")
+		returnCode = InvalidParameter
+	} else {
+		switch r.Method {
+		case "GET":
+			value, ok := service.state.ActiveLBs[req.LoadBalancerID]
+			if !ok {
+				returnMessage = "[Azure CNS] Error. Could not find load balancer with given ID."
+				returnCode = InvalidParameter
+				break
+			}
+			LBConfig = value.(cns.LBConfiguration)
+		default:
+			returnMessage = "[Azure CNS] Error. RetrieveLoadBalancer did not receive a GET."
+			returnCode = InvalidParameter
+		}
+	}
+	resp := cns.Response{
+		ReturnCode: returnCode,
+		Message:    returnMessage,
+	}
+
+	LBResp := &cns.RetrieveLoadBalancerResponse{Response: resp, LoadBalancer: LBConfig}
+	err = service.Listener.Encode(w, &LBResp)
+
+	log.Response(service.Name, LBResp, err)
+}
+
+// Handles deletion of a load balancer
+func (service *httpRestService) deleteLoadBalancer(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[Azure CNS] deleteLoadBalancer")
+
+	service.Lock()
+	defer service.Unlock()
+
+	var req cns.DeleteLoadBalancerRequest
+	returnCode := 0
+	returnMessage := ""
+
+	err := service.Listener.Decode(w, r, &req)
+	log.Request(service.Name, &req, err)
+
+	if err != nil {
+		returnMessage = fmt.Sprintf("[Azure CNS] Error. Unable to decode input request.")
+		returnCode = InvalidParameter
+	} else {
+		switch r.Method {
+		case "POST":
+			ipt := service.ipTable
+
+			lbConfig, ok := service.state.ActiveLBs[req.LoadBalancerID]
+			if !ok {
+				returnMessage = "[Azure CNS] Error. Load balancer with given ID does not exist."
+				returnCode = InvalidParameter
+				break
+			}
+
+			err := ipt.EnableIPForwarding()
+			if err != nil {
+				returnMessage = "[Azure CNS] Error. Unable to enable load balancer port forwarding."
+				returnCode = UnexpectedError
+				break
+			}
+
+			err = ipt.EnableMasquerade()
+			if err != nil {
+				returnMessage = "[Azure CNS] Error. Unable to enable load balancer masquerading."
+				returnCode = UnexpectedError
+				break
+			}
+
+			err = ipt.DeletePreroutingFilters(lbConfig.(cns.LBConfiguration))
+			if err != nil {
+				returnMessage = "[Azure CNS] Error. Unable to delete load balancer filters from the network."
+				returnCode = UnexpectedError
+			} else {
+				delete(service.state.ActiveLBs, req.LoadBalancerID)
+				service.saveState()
+			}
+
+		default:
+			returnMessage = "[Azure CNS] Error. DeleteLoadBalancer did not receive a POST."
+			returnCode = InvalidParameter
+		}
+	}
+	resp := cns.Response{
+		ReturnCode: returnCode,
+		Message:    returnMessage,
+	}
+
+	err = service.Listener.Encode(w, &resp)
 	log.Response(service.Name, resp, err)
 }
 
